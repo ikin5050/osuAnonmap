@@ -136,6 +136,10 @@ for folder in oszf:
                 repl = 'BeatmapID:0'
             elif line.startswith('BeatmapSetID'):
                 repl = 'BeatmapSetID:-1'
+            elif line.startswith('DistanceSpacing: '):
+                repl = 'DistanceSpacing: 1.4'
+            elif line.startswith('BeatDivisor:'):
+                repl = 'BeatDivisor: 4'
             elif line.startswith('Bookmarks'):
                 repl = 'Bookmarks:'
             elif len(line.split(',')) == 6 and config['taiko'] ==True:
