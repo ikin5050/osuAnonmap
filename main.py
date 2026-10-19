@@ -1,200 +1,186 @@
-import zipfile
-import os
-import shutil
-import adjnoun
+"""Anonymise osu! mapping contest entries. See README.md for setup."""
+
+from __future__ import annotations
+
 import json
-import format
+import shutil
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
 
-with open('./config.json') as config_json:
-    config = json.load(config_json)
+import beatmap
+import mask
+from names import NameGenerator
 
-def zip_folder(folder_path, output_path):
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(folder_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, folder_path)
-                zipf.write(file_path, arcname=arcname)
-
-    return
-
-def str_to_bool(str):
-    if str.lower()=="false":
-        return False
-    else:
-        return True
-
-unanonymize = {}
-
-config['numberDiffs'] = int(config['numberDiffs'])
-config['taiko'] = str_to_bool(config['taiko'])
-
-HOME = os.getcwd()
-maps = os.path.join(HOME, 'maps.zip')
-unzip = os.path.join(HOME, 'unzip')
-oszs = os.path.join(HOME, 'oszs')
-tozip = os.path.join(HOME, 'tozip')
-decode = os.path.join(HOME, 'decode.json')
-outdir = os.path.join(HOME, 'output')
-
-if os.path.exists(outdir):
-    shutil.rmtree(outdir)
-if os.path.exists(unzip):
-    shutil.rmtree(unzip)
-if os.path.exists(oszs):
-    shutil.rmtree(oszs)
-if os.path.exists(tozip):
-    shutil.rmtree(tozip)
-if os.path.exists(decode):
-    os.remove(decode)
-if os.path.exists('./anonmaps.zip'):
-    os.remove('./anonmaps.zip')
-
-os.mkdir(unzip)
-os.mkdir(oszs)
-os.mkdir(tozip)
-
-with zipfile.ZipFile(maps, "r") as zip_ref:
-    zip_ref.extractall(unzip)
+ROOT = Path.cwd()
+CONFIG_PATH = ROOT / "config.json"
+TOKEN_PATH = ROOT / "token.json"
+MAPS_ZIP = ROOT / "maps.zip"
+OUTPUT_DIR = ROOT / "output"
 
 
+class SetupError(Exception):
+    pass
 
-extr = os.listdir(unzip)
-for dir in extr:
-    for file in os.listdir(os.path.join(unzip, dir)):
-        dirfile = dir + file
-        os.mkdir(os.path.join(oszs, dirfile))
+
+@dataclass
+class Config:
+    tournament_name: str
+    number_diffs: int  # 0 means any number is allowed
+    taiko: bool
+
+
+@dataclass
+class Entry:
+    label: str  # where the .osz came from in maps.zip, for messages
+    folder: Path
+    creators: list[str] = field(default_factory=list)
+    anon_name: str = ""
+
+
+def parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("false", "0", "no", "")
+
+
+def load_config(path: Path) -> Config:
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        return Config(
+            tournament_name=str(raw["tournamentName"]),
+            number_diffs=int(raw.get("numberDiffs", 0)),
+            taiko=parse_bool(raw.get("taiko", False)),
+        )
+    except FileNotFoundError:
+        raise SetupError(f"{path.name} not found")
+    except (json.JSONDecodeError, KeyError, ValueError) as error:
+        raise SetupError(f"{path.name} is not valid: {error}")
+
+
+def load_api_key(path: Path) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            token = json.load(f)["token"]
+    except FileNotFoundError:
+        raise SetupError(f"{path.name} not found; see README.md")
+    except json.JSONDecodeError:
+        raise SetupError(f"{path.name} is not formatted properly, surround the values in double quotation marks")
+    except (KeyError, TypeError):
+        raise SetupError(f'{path.name} must contain a "token" value')
+    if not isinstance(token, str) or not token.strip() or token.startswith("<"):
+        raise SetupError(f"{path.name} does not contain a valid API token")
+    return token.strip()
+
+
+def zip_folder(folder: Path, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for path in sorted(folder.rglob("*")):
+            if path.is_file():
+                zipf.write(path, arcname=path.relative_to(folder).as_posix())
+
+
+def extract_entries(maps_zip: Path, work_dir: Path) -> list[Entry]:
+    """Unpack maps.zip, then every .osz inside it into its own folder."""
+    submissions = work_dir / "submissions"
+    try:
+        with zipfile.ZipFile(maps_zip) as zipf:
+            zipf.extractall(submissions)
+    except zipfile.BadZipFile:
+        raise SetupError(f"{maps_zip.name} is not a valid zip file")
+
+    entries = []
+    for path in sorted(submissions.rglob("*")):
+        if not path.is_file() or "__MACOSX" in path.parts or path.name.startswith("."):
+            continue
+        label = path.relative_to(submissions).as_posix()
+        if path.suffix.lower() != ".osz":
+            print(f"Skipping {label}: not an .osz file")
+            continue
+        folder = work_dir / "entries" / str(len(entries))
         try:
-            with zipfile.ZipFile(os.path.join(unzip, dir, file), 'r') as t_zip:
-                t_zip.extractall(os.path.join(oszs, dirfile))
+            with zipfile.ZipFile(path) as zipf:
+                zipf.extractall(folder)
         except zipfile.BadZipFile:
-            #print('\nentry invalid %s' % os.path.join(unzip,dir,file))
-            pass
-
-
-oszf = os.listdir(oszs)
-print('Anonymizing .osz files')
-for folder in oszf:
-    if len(os.listdir(os.path.join(oszs, folder))) == 0:
-        pass
-
-    newName = adjnoun.get()
-    allfiles = [x for x in os.listdir(os.path.join(oszs, folder))]
-    for file in allfiles:
-        if file.endswith('.osb'):
-            os.remove(os.path.join(oszs, folder, file))
-        if os.path.isdir(os.path.join(oszs, folder, file)):
-            shutil.rmtree(os.path.join(oszs, folder, file))
-    oslist = [x for x in os.listdir(os.path.join(oszs, folder)) if x.endswith('.osu')]
-    imlist = [x for x in os.listdir(os.path.join(oszs, folder)) if x.endswith(('.jpg', '.png'))]
-    audiolist = [x for x in os.listdir(os.path.join(oszs, folder)) if x.endswith(('.ogg', '.mp3'))]
-    if len(oslist) != config['numberDiffs']:
-        if config['numberDiffs'] != 0:
-            print('\nError: %s includes wrong number of .osu files' % folder)
+            print(f"Error: {label} is not a valid .osz file")
             continue
-    ctr = 0
-    newName = adjnoun.get()
-    for file in oslist:
-        tow = []
-        with open(os.path.join(oszs, folder, file), encoding='utf8') as f:
-            lines = [line.rstrip() for line in f]
-        for line in lines:
-            repl = False
-            if line.startswith('Creator'):
-                unanonymize[newName] = line[8:]
-                repl = 'Creator: Anonymous'
-            elif line.startswith('TimelineZoom'):
-                repl = 'TimelineZoom: 2.6'
-            elif line.startswith('GridSize'):
-                repl = 'GridSize: 64'
-            elif line.startswith('Tags:'):
-                repl = 'Tags:'
-            elif line.startswith('CircleSize') and config['taiko'] ==True:
-                repl = 'CircleSize:5'
-            elif line.startswith('ApproachRate') and config['taiko'] ==True:
-                repl = 'ApproachRate:5'
-            elif line.startswith('Version:'):
-                repl = 'Version: ' + newName
-                if len(oslist) > 1:
-                    repl += ' ' + str(ctr+1)
-                    ctr+=1
-            elif line.startswith('Source'):
-                repl = 'Source:'
-            elif line.startswith('0,0,"'):
-                bg = line.split(',')[2]
-                bg = bg.replace('"', '')
-                ext = bg[-4:]
-                splt = line.split(',')
-                repl = splt[0]+','+splt[1]+','+'"bg'+ext+'",'+splt[3]+','+splt[4]
-                nname = 'bg'+ext
-                bgp = os.path.join(oszs, folder, bg)
-                try:
-                    os.rename(bgp, os.path.join(oszs, folder, nname))
-                except FileNotFoundError:
-                    pass
-            elif line.startswith("BeatmapID"):
-                repl = 'BeatmapID:0'
-            elif line.startswith('BeatmapSetID'):
-                repl = 'BeatmapSetID:-1'
-            elif line.startswith('DistanceSpacing: '):
-                repl = 'DistanceSpacing: 1.4'
-            elif line.startswith('BeatDivisor:'):
-                repl = 'BeatDivisor: 4'
-            elif line.startswith('Bookmarks'):
-                repl = 'Bookmarks:'
-            elif len(line.split(',')) == 6 and config['taiko'] ==True:
-                repl = '256,192,'+','.join(line.split(',')[2:])
-            elif len(line.split(',')) == 7 and config['taiko'] ==True:
-                repl = '256,192,' + ','.join(line.split(',')[2:])
-            if repl:
-                tow.append(repl+'\n')
-            else:
-                tow.append(line+'\n')
-        if len(oslist) > 1:
-            fntosave = os.path.join(oszs, folder, 'beatmap (' + newName + str(ctr) + ').osu')
-        else:
-            fntosave = os.path.join(oszs, folder, 'beatmap (' + newName + ').osu')
-        f = open(fntosave, "a", encoding='utf8')
-        f.writelines(tow)
-        f.close()
-        os.remove(os.path.join(oszs, folder, file))
+        entries.append(Entry(label=label, folder=folder))
+    return entries
 
 
-    #remove all images except background, assuming 1 bg for all diffs
-    for im in imlist:
-        if im == bg:
-            continue
-        else:
-            os.remove(os.path.join(oszs, folder, im))
-
-    toz = os.path.join(oszs, folder)
-    outn = config['tournamentName'] + ' (' + newName+').osz'
-    ouz = os.path.join(tozip, outn)
-    zip_folder(toz, ouz)
-
-
-shutil.rmtree(unzip)
-
-with open('decode.json', 'w') as decode_json:
-    json.dump(unanonymize, decode_json)
+def validate_entry(entry: Entry, config: Config) -> bool:
+    osu_files = beatmap.find_osu_files(entry.folder)
+    if not osu_files:
+        print(f"Error: {entry.label} contains no .osu files")
+        return False
+    if config.number_diffs and len(osu_files) != config.number_diffs:
+        print(f"Error: {entry.label} has {len(osu_files)} .osu files, expected {config.number_diffs}")
+        return False
+    entry.creators = beatmap.read_creators(osu_files)
+    if not entry.creators:
+        print(f"Error: {entry.label} has no Creator in its .osu files, so it can't be unmasked later")
+        return False
+    return True
 
 
-zip_folder(tozip, os.path.join(HOME, 'anonmaps.zip'))
-success = format.formatMask(HOME)
+def run() -> bool:
+    config = load_config(CONFIG_PATH)
+    api_key = load_api_key(TOKEN_PATH)
+    if not MAPS_ZIP.exists():
+        raise SetupError(f"{MAPS_ZIP.name} not found in {ROOT}")
 
-shutil.rmtree(tozip)
-shutil.rmtree(oszs)
+    if OUTPUT_DIR.exists():
+        shutil.rmtree(OUTPUT_DIR)
 
-os.remove('./decode.json')
-os.mkdir(outdir)
-os.rename('./anonmaps.zip', os.path.join(outdir, 'anonmaps.zip'))
-os.rename('./masking.csv', os.path.join(outdir, 'masking.csv'))
+    with tempfile.TemporaryDirectory() as tmp:
+        work_dir = Path(tmp)
+        found = extract_entries(MAPS_ZIP, work_dir)
+        entries = [e for e in found if validate_entry(e, config)]
+
+        names = NameGenerator(creator for e in entries for creator in e.creators)
+        for entry in entries:
+            entry.anon_name = names.new_name()
+
+        print("Anonymising .osz files")
+        osz_dir = work_dir / "anonymised"
+        osz_dir.mkdir()
+        done = []
+        for entry in entries:
+            for warning in beatmap.anonymise_entry(entry.folder, entry.anon_name, config.taiko):
+                print(f"Warning: {entry.label}: {warning}")
+
+            leaks = beatmap.find_leaks(entry.folder, entry.creators, entry.anon_name)
+            if leaks:
+                print(f"Error: {entry.label} left out, it may not be fully anonymised:")
+                for leak in leaks:
+                    print(f"    {leak}")
+                continue
+
+            zip_folder(entry.folder, osz_dir / f"{config.tournament_name} ({entry.anon_name}).osz")
+            done.append(entry)
+
+        OUTPUT_DIR.mkdir()
+        zip_folder(osz_dir, OUTPUT_DIR / "anonmaps.zip")
+
+    mask_ok = mask.write_mask(OUTPUT_DIR / "masking.csv", [(e.creators[0], e.anon_name) for e in done], api_key)
+
+    print(f"\nAnonymised {len(done)} entries into {OUTPUT_DIR / 'anonmaps.zip'}")
+    if len(done) < len(found) or not mask_ok:
+        print("Some entries need attention; see the errors above.")
+    return mask_ok
 
 
+def main() -> int:
+    try:
+        return 0 if run() else 1
+    except SetupError as error:
+        print(f"Error: {error}")
+        return 1
 
 
-
-if success:
-    print('Your contest entries are now anonymized, apart from the ones listed above that failed')
-else:
-    print('Oops I did a fucky wucky')
+if __name__ == "__main__":
+    sys.exit(main())

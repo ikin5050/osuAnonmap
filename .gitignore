@@ -1,6 +1,6 @@
 *.zip
 /token.json
-/decode.json
+/output/
 *.csv
 *.xml
 *.iml
